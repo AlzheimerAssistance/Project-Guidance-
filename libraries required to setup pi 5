@@ -1,0 +1,16 @@
+sudo apt update
+sudo apt upgrade -y
+sudo apt install python3-venv -y
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+pip install --upgrade pip
+python3 -c "from picamera2 import Picamera2; print('Camera OK')"
+pip install ultralytics
+pip install torch torchvision
+pip install opencv-contrib-python
+pip install SpeechRecognition
+pip install pyttsx3
+pip install pyaudio
+pip install numpy
+rpicam-hello
+source venv/bin/activate
