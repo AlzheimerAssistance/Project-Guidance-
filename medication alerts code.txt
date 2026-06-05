@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+Medication Alert Module - Raspberry Pi 5
+Reads from Firebase, matches time EXACTLY, speaks alert via speaker.
+
+Firebase Structure:
+  esp32/medication_alert/
+      med_name  : "panadol"
+      med_time  : "08:00 AM"
+      triggered : false / true
+
+  esp32/medications/
+      med_1/
+          enabled : true
+          name    : "panadol"
+          time    : "08:00 AM"
+"""
+
+import time
+import subprocess
+import logging
+from datetime import datetime
+import firebase_admin
+from firebase_admin import credentials, db
+
+# ─────────────────────────────────────────────────────
+#  CONFIGURATION
+# ─────────────────────────────────────────────────────
+FIREBASE_URL       = "https://monitoring-f740a-default-rtdb.asia-southeast1.firebasedatabase.app/"
+CRED_FILE          = "firebase_credentials.json"   # same folder as this script
+CHECK_EVERY        = 15                             # check Firebase every 20 seconds
+TIME_TOLERANCE_MIN = 0                              # ±1 minute tolerance only
+
+# ─────────────────────────────────────────────────────
+#  LOGGING
+# ─────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("medication_alert.log")
+    ]
+)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────
+#  FIREBASE INIT
+# ─────────────────────────────────────────────────────
+def init_firebase():
+    try:
+        firebase_admin.get_app()
+        log.info("✅ Firebase already initialised — reusing.")
+    except ValueError:
+        cred = credentials.Certificate(CRED_FILE)
+        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_URL})
+        log.info("✅ Firebase initialised successfully.")
+
+# ─────────────────────────────────────────────────────
+#  SPEAK via espeak
+# ─────────────────────────────────────────────────────
+def speak(text: str):
+    log.info(f"🔊 SPEAKING: {text}")
+    try:
+        subprocess.run(
+            ["espeak", "-v", "en", "-s", "120", "-a", "200", text],
+            check=True
+        )
+    except FileNotFoundError:
+        log.error("espeak not found! Run: sudo apt install espeak")
+
+# ─────────────────────────────────────────────────────
+#  TIME PARSER — handles "08:00 AM", "08:00", "8:00"
+# ─────────────────────────────────────────────────────
+def parse_time(time_str: str):
+    time_str = time_str.strip()
+    for fmt in ["%I:%M %p", "%H:%M", "%I:%M:%S %p", "%H:%M:%S"]:
+        try:
+            t = datetime.strptime(time_str, fmt)
+            now = datetime.now()
+            return now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        except ValueError:
+            continue
+    log.warning(f"⚠️  Cannot parse time: '{time_str}'")
+    return None
+
+def time_matches(med_time_str: str) -> bool:
+    """
+    Returns True ONLY when current time is within ±1 minute of scheduled time.
+    At 11:00, scheduled 11:05 → diff=5 min → NO MATCH (will not speak early)
+    At 11:05, scheduled 11:05 → diff=0 min → MATCH (speaks exactly on time)
+    """
+    med_dt = parse_time(med_time_str)
+    if med_dt is None:
+        return False
+    now  = datetime.now().replace(second=0, microsecond=0)
+    diff = abs((now - med_dt).total_seconds()) / 60
+    log.info(f"   ⏰ Scheduled: {med_dt.strftime('%I:%M %p')}  |  Now: {now.strftime('%I:%M %p')}  |  Diff: {diff:.1f} min")
+    return diff <= TIME_TOLERANCE_MIN
+
+# ─────────────────────────────────────────────────────
+#  RESET triggered → false after alert spoken
+# ─────────────────────────────────────────────────────
+def reset_triggered():
+    try:
+        db.reference("esp32/medication_alert/triggered").set(False)
+        db.reference("esp32/medication_alert/timestamp").set("Alert delivered - handled")
+        log.info("✅ triggered reset to false in Firebase.")
+    except Exception as e:
+        log.error(f"Reset error: {e}")
+
+# ─────────────────────────────────────────────────────
+#  SPEAK MEDICATION ALERT
+# ─────────────────────────────────────────────────────
+def speak_medication_alert(med_name: str, med_time: str):
+    message = (
+        f"Attention! It is time to take your medicine. "
+        f"Please take {med_name}. "
+        f"It is time to take {med_name}. "
+        f"Please take your medicine now."
+    )
+    speak(message)
+    time.sleep(3)
+    speak(message)   # repeat twice so patient doesn't miss it
+    log.info(f"🔔 Alert spoken for: {med_name} at {med_time}")
+
+# ─────────────────────────────────────────────────────
+#  CHECK SINGLE MEDICATION ALERT NODE
+#  esp32/medication_alert/
+#  Logic: triggered=true AND time matches → speak
+#         triggered=true BUT time not yet → wait silently
+# ─────────────────────────────────────────────────────
+def check_medication_alert():
+    data = db.reference("esp32/medication_alert").get()
+    if not data:
+        log.info("ℹ️  No data at esp32/medication_alert")
+        return
+
+    triggered = data.get("triggered", False)
+    med_name  = data.get("med_name", "your medicine")
+    med_time  = data.get("med_time", "")
+
+    log.info(f"📋 medication_alert → triggered={triggered}  med_name={med_name}  med_time={med_time}")
+
+    if triggered is True or str(triggered).lower() == "true":
+        log.info("🚨 triggered=true detected! Checking if time matches...")
+
+        if not med_time:
+            log.warning("⚠️  No med_time in Firebase — cannot match time. Skipping.")
+            return
+
+        if time_matches(med_time):
+            log.info("✅ TIME MATCHED — Speaking alert now!")
+            speak_medication_alert(med_name, med_time)
+            reset_triggered()
+        else:
+            log.info(f"⏳ triggered=true but time not yet. Still waiting for {med_time} ...")
+
+    else:
+        log.info("✅ medication_alert: No active alert (triggered=false)")
+
+# ─────────────────────────────────────────────────────
+#  CHECK MULTIPLE MEDICATIONS NODE
+#  esp32/medications/med_1, med_2, ...
+#  Logic: only speak when time EXACTLY matches (±1 min)
+# ─────────────────────────────────────────────────────
+def check_medications_list():
+    data = db.reference("esp32/medications").get()
+    if not data:
+        return
+
+    log.info(f"📋 Found {len(data)} medication(s) in esp32/medications")
+
+    for med_id, med in data.items():
+        if not isinstance(med, dict):
+            continue
+
+        enabled  = med.get("enabled", False)
+        name     = med.get("name", "medicine")
+        med_time = med.get("time", "")
+
+        if not enabled:
+            log.info(f"   [{med_id}] {name} — disabled, skipping.")
+            continue
+
+        log.info(f"   [{med_id}] {name} at {med_time} — enabled, checking time...")
+
+        if not med_time:
+            log.warning(f"   [{med_id}] No time set, skipping.")
+            continue
+
+        if time_matches(med_time):
+            log.info(f"✅ TIME MATCHED for {name} — Speaking alert!")
+            speak_medication_alert(name, med_time)
+            # Disable after speaking so it doesn't repeat
+            try:
+                db.reference(f"esp32/medications/{med_id}/enabled").set(False)
+                log.info(f"✅ {med_id} disabled after alert.")
+            except Exception as e:
+                log.error(f"Could not disable {med_id}: {e}")
+        else:
+            log.info(f"   [{med_id}] {name} — not time yet, waiting...")
+
+# ─────────────────────────────────────────────────────
+#  MAIN LOOP
+# ─────────────────────────────────────────────────────
+def main():
+    log.info("════════════════════════════════════════")
+    log.info("   💊 Medication Alert Module — Started")
+    log.info(f"   ⏱  Checking every {CHECK_EVERY}s | Tolerance ±{TIME_TOLERANCE_MIN} min")
+    log.info("════════════════════════════════════════")
+
+    init_firebase()
+
+    while True:
+        try:
+            log.info("─── Checking Firebase ───────────────────")
+
+            check_medication_alert()   # esp32/medication_alert/
+            check_medications_list()   # esp32/medications/med_1, med_2 ...
+
+        except KeyboardInterrupt:
+            log.info("🛑 Stopped by user.")
+            break
+        except Exception as e:
+            log.error(f"❌ Unexpected error: {e}", exc_info=True)
+
+        log.info(f"⏳ Sleeping {CHECK_EVERY}s before next check...\n")
+        time.sleep(CHECK_EVERY)
+
+if __name__ == "__main__":
+    main()
