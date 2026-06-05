@@ -1,50 +1,84 @@
-# Project-Guidance-
+# Raspberry Pi 5 Setup
 
-Raspberry Pi 5 Environment Setup
+## 1. Update System
 
-Install Raspberry Pi OS (64-bit) on Raspberry Pi 5.
-
-1)
-Update the system packages:
+```bash
 sudo apt update
 sudo apt upgrade -y
+```
 
-2)
-Install Python development tools:
-sudo apt install python3-pip python3-venv -y
+## 2. Install Virtual Environment Support
 
-3)
-Create a dedicated Python virtual environment:
-python3 -m venv venv
+```bash
+sudo apt install python3-venv -y
+```
 
-4)
-Activate the virtual environment:
+## 3. Create Virtual Environment with Raspberry Pi System Packages
+
+```bash
+python3 -m venv --system-site-packages venv
+```
+
+## 4. Activate Virtual Environment
+
+```bash
 source venv/bin/activate
+```
 
-5)
-Upgrade pip inside the virtual environment:
+## 5. Upgrade Pip
+
+```bash
 pip install --upgrade pip
+```
 
-6)
-Install OpenCV and required computer vision libraries.
-Install NumPy for numerical computations.
-Install Picamera2 library for Raspberry Pi camera integration.
-Install PyTorch and TorchVision for AI model execution.
-Install Ultralytics package for YOLOv8-based object detection and pose estimation.
-Install MediaPipe for human pose and landmark processing (if used).
-Install SpeechRecognition for speech-to-text functionality.
-Install eSpeak / pyttsx3 for text-to-speech feedback.
-Install Bluetooth audio support for wireless speaker output.
-Configure and test the Raspberry Pi Camera Module.
-Verify all libraries and hardware components before running project modules.
+## 6. Install Required Python Packages
 
+```bash
+pip install ultralytics
+pip install torch torchvision
+pip install opencv-contrib-python
+pip install numpy
+pip install SpeechRecognition
+pip install pyttsx3
+pip install pyaudio
+```
 
+## 7. Verify Camera Access
 
-7)
-Project Execution
+```bash
+python3 -c "from picamera2 import Picamera2; print('Camera OK')"
+```
 
-Activate the virtual environment:
+## 8. Verify Raspberry Pi Camera
+
+```bash
+rpicam-hello
+```
+
+## 9. Run the Project
+
+```bash
 source venv/bin/activate
+python3 main.py
+```
 
+# Main Libraries Used
 
+* Picamera2 (Raspberry Pi Camera Interface)
+* OpenCV (Computer Vision)
+* OpenCV-Contrib (LBPH Face Recognition)
+* Ultralytics YOLOv8 (Object Detection & Pose Estimation)
+* PyTorch (Deep Learning Backend)
+* NumPy (Numerical Computation)
+* SpeechRecognition (Speech-to-Text)
+* eSpeak / pyttsx3 (Text-to-Speech)
 
+# Project Modules
+
+* Fall Detection using YOLOv8 Pose Estimation
+* Family Member Recognition using Haar Cascade + LBPH
+* Medication Reminder using Voice Interaction
+* Patient Tracking and Monitoring
+* Voice-Based Communication System
+* Emergency Alert System
+* Smart Caregiver Assistant
