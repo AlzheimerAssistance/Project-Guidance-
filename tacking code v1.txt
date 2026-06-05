@@ -1,0 +1,465 @@
+"""
+Patient Follower Robot
+======================
+- YOLOv8n person detection
+- Centroid tracker (locks first detected person as PATIENT)
+- Smooth proportional turning (no sharp/rash moves)
+- Bounding box HEIGHT drives forward/stop/backward
+- Bluetooth TTS alert when no patient in frame
+- Displays bounding box height on screen for observation
+"""
+
+from ultralytics import YOLO
+from picamera2 import Picamera2
+import cv2
+import time
+import numpy as np
+from scipy.spatial import distance as dist
+import RPi.GPIO as GPIO
+import subprocess
+import threading
+
+# ============================================================
+# GPIO / MOTOR SETUP
+# ============================================================
+L_RPWM = 20
+L_LPWM = 21
+L_REN  = 12
+L_LEN  = 16
+
+R_RPWM = 19
+R_LPWM = 26
+R_REN  = 6
+R_LEN  = 13
+
+GPIO.setmode(GPIO.BCM)
+pins = [L_RPWM, L_LPWM, L_REN, L_LEN,
+        R_RPWM, R_LPWM, R_REN, R_LEN]
+for pin in pins:
+    GPIO.setup(pin, GPIO.OUT)
+
+l_rpwm = GPIO.PWM(L_RPWM, 1000)
+l_lpwm = GPIO.PWM(L_LPWM, 1000)
+r_rpwm = GPIO.PWM(R_RPWM, 1000)
+r_lpwm = GPIO.PWM(R_LPWM, 1000)
+
+l_rpwm.start(0)
+l_lpwm.start(0)
+r_rpwm.start(0)
+r_lpwm.start(0)
+
+GPIO.output(L_REN, GPIO.HIGH)
+GPIO.output(L_LEN, GPIO.HIGH)
+GPIO.output(R_REN, GPIO.HIGH)
+GPIO.output(R_LEN, GPIO.HIGH)
+
+# ============================================================
+# MOTOR PRIMITIVES
+# ============================================================
+def stop():
+    l_rpwm.ChangeDutyCycle(0)
+    l_lpwm.ChangeDutyCycle(0)
+    r_rpwm.ChangeDutyCycle(0)
+    r_lpwm.ChangeDutyCycle(0)
+
+def forward(speed=40):
+    l_rpwm.ChangeDutyCycle(0)
+    l_lpwm.ChangeDutyCycle(speed)
+    r_rpwm.ChangeDutyCycle(0)
+    r_lpwm.ChangeDutyCycle(speed)
+
+def backward(speed=35):
+    l_rpwm.ChangeDutyCycle(speed)
+    l_lpwm.ChangeDutyCycle(0)
+    r_rpwm.ChangeDutyCycle(speed)
+    r_lpwm.ChangeDutyCycle(0)
+
+def smooth_left(turn_strength):
+    """
+    Proportional left turn.
+    turn_strength: 0.0 (almost straight) → 1.0 (full left pivot)
+    Base forward speed is reduced on left motor, boosted on right.
+    """
+    BASE = 40
+    reduction = int(turn_strength * 30)
+    left_speed  = max(0,  BASE - reduction)
+    right_speed = min(70, BASE + reduction)
+
+    l_rpwm.ChangeDutyCycle(0)
+    l_lpwm.ChangeDutyCycle(left_speed)
+    r_rpwm.ChangeDutyCycle(0)
+    r_lpwm.ChangeDutyCycle(right_speed)
+
+def smooth_right(turn_strength):
+    """
+    Proportional right turn.
+    turn_strength: 0.0 (almost straight) → 1.0 (full right pivot)
+    """
+    BASE = 40
+    reduction = int(turn_strength * 30)
+    left_speed  = min(70, BASE + reduction)
+    right_speed = max(0,  BASE - reduction)
+
+    l_rpwm.ChangeDutyCycle(0)
+    l_lpwm.ChangeDutyCycle(left_speed)
+    r_rpwm.ChangeDutyCycle(0)
+    r_lpwm.ChangeDutyCycle(right_speed)
+
+# ============================================================
+# DISTANCE / SPEED LOGIC BASED ON BOUNDING BOX HEIGHT
+# ============================================================
+HEIGHT_TOO_CLOSE  = 500
+HEIGHT_SAFE_MAX   = 500
+HEIGHT_SAFE_MIN   = 400
+HEIGHT_TOO_FAR    = 400
+
+# ============================================================
+# ZONE THRESHOLDS FOR TURNING
+# ============================================================
+# Divide frame into 5 slices for smoother gradient turning.
+# Outermost slice → max turn; innermost → gentle correction.
+# Defined as fractions of frame width.
+# Zone boundaries (left to right):
+#   |--FAR_L--|--NEAR_L--|------CENTER------|--NEAR_R--|--FAR_R--|
+#
+# CENTER ZONE: 30–70% (wider than original 35–65%)
+
+FAR_L_FRAC   = 0.15   # 0–15%   → human on LEFT  → robot turns LEFT
+NEAR_L_FRAC  = 0.30   # 15–30%  → human on LEFT  → robot turns LEFT (gentle)
+NEAR_R_FRAC  = 0.70   # 70–85%  → human on RIGHT → robot turns RIGHT (gentle)
+FAR_R_FRAC   = 0.85   # 85–100% → human on RIGHT → robot turns RIGHT (strong)
+# 30–70% = CENTER → go straight (or fwd/bwd only)
+
+TURN_STRONG  = 0.85
+TURN_GENTLE  = 0.35
+
+# ============================================================
+# TTS / BLUETOOTH AUDIO
+# ============================================================
+NO_PATIENT_INTERVAL = 5
+
+def speak(text):
+    """Non-blocking espeak via Bluetooth (default ALSA sink)."""
+    def _run():
+        padded = ", , , " + text
+        subprocess.run(
+            ["espeak", "-v", "en", "-s", "110", "-g", "8", padded],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    threading.Thread(target=_run, daemon=True).start()
+
+# ============================================================
+# YOLO MODEL
+# ============================================================
+model = YOLO("yolov8n.pt")
+
+# ============================================================
+# CAMERA
+# ============================================================
+picam2 = Picamera2(1)
+config = picam2.create_preview_configuration(
+    main={"size": (640, 480), "format": "RGB888"}
+)
+picam2.configure(config)
+picam2.start()
+time.sleep(2)
+print("System Started")
+
+# ============================================================
+# CENTROID TRACKER
+# ============================================================
+class CentroidTracker:
+    """
+    Centroid tracker with PROTECTED ID support.
+    - protected_id: this object is NEVER deregistered, no matter
+      how many frames it disappears for.
+    - All other IDs are deregistered normally after max_disappeared.
+    - max_distance raised to 120 px so fast motion doesn't break lock.
+    """
+
+    def __init__(self, max_disappeared=50, max_distance=120):
+        self.next_object_id  = 0
+        self.objects         = {}
+        self.disappeared     = {}
+        self.max_disappeared = max_disappeared
+        self.max_distance    = max_distance
+        self.protected_id    = None
+
+    def register(self, centroid):
+        self.objects[self.next_object_id]     = centroid
+        self.disappeared[self.next_object_id] = 0
+        self.next_object_id += 1
+
+    def deregister(self, oid):
+        if oid == self.protected_id:
+            return
+        del self.objects[oid]
+        del self.disappeared[oid]
+
+    def update(self, rects):
+        if len(rects) == 0:
+            for oid in list(self.disappeared.keys()):
+                self.disappeared[oid] += 1
+                if self.disappeared[oid] > self.max_disappeared:
+                    self.deregister(oid)
+            return self.objects
+
+        input_centroids = np.zeros((len(rects), 2), dtype="int")
+        for i, (x1, y1, x2, y2) in enumerate(rects):
+            input_centroids[i] = (int((x1+x2)/2), int((y1+y2)/2))
+
+        if len(self.objects) == 0:
+            for c in input_centroids:
+                self.register(c)
+            return self.objects
+
+        object_ids       = list(self.objects.keys())
+        object_centroids = list(self.objects.values())
+        D    = dist.cdist(np.array(object_centroids), input_centroids)
+        rows = D.min(axis=1).argsort()
+        cols = D.argmin(axis=1)[rows]
+
+        used_rows, used_cols = set(), set()
+        for row, col in zip(rows, cols):
+            if row in used_rows or col in used_cols:
+                continue
+            if D[row, col] > self.max_distance:
+                continue
+            oid = object_ids[row]
+            self.objects[oid]     = input_centroids[col]
+            self.disappeared[oid] = 0
+            used_rows.add(row)
+            used_cols.add(col)
+
+        for row in set(range(D.shape[0])) - used_rows:
+            oid = object_ids[row]
+            self.disappeared[oid] += 1
+            if self.disappeared[oid] > self.max_disappeared:
+                self.deregister(oid)
+
+        for col in set(range(D.shape[1])) - used_cols:
+            self.register(input_centroids[col])
+
+        return self.objects
+
+# ============================================================
+# INIT
+# ============================================================
+tracker   = CentroidTracker()
+locked_id = None
+locked    = False
+
+last_no_patient_alert = 0
+lost_alert_count      = 0
+
+print("Waiting for patient...")
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+try:
+    while True:
+
+        frame   = picam2.capture_array()
+        results = model(frame, verbose=False)
+
+        rects = []
+        for r in results:
+            for box in r.boxes:
+                if int(box.cls[0]) == 0:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    rects.append((x1, y1, x2, y2))
+
+        objects = tracker.update(rects)
+
+        num_boxes = len(rects)
+
+        h, w = frame.shape[:2]
+
+        # --- Zone dividers (5 slices, wider center) ---
+        far_l_x  = int(w * FAR_L_FRAC)    # 15% = 96px
+        near_l_x = int(w * NEAR_L_FRAC)   # 30% = 192px
+        near_r_x = int(w * NEAR_R_FRAC)   # 70% = 448px
+        far_r_x  = int(w * FAR_R_FRAC)    # 85% = 544px
+
+        cv2.line(frame, (far_l_x,  0), (far_l_x,  h), (180,180,180), 1)
+        cv2.line(frame, (near_l_x, 0), (near_l_x, h), (255,255,255), 2)
+        cv2.line(frame, (near_r_x, 0), (near_r_x, h), (255,255,255), 2)
+        cv2.line(frame, (far_r_x,  0), (far_r_x,  h), (180,180,180), 1)
+
+        cv2.putText(frame, "<<L",  (5,          25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,180,180), 1)
+        cv2.putText(frame, "<L",   (far_l_x+4,  25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+        cv2.putText(frame, "CTR",  (near_l_x+4, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+        cv2.putText(frame, "R>",   (near_r_x+4, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+        cv2.putText(frame, "R>>",  (far_r_x+4,  25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,180,180), 1)
+
+        patient_found   = False
+        cmd             = "STOP"
+        turn_str        = 0.0
+        confusion_alert = False
+
+        # ── MULTI-BOX CONFUSION CHECK ──────────────────────────────
+        if num_boxes > 1:
+            confusion_alert = True
+            stop()
+            cmd = "CONFUSION"
+            now = time.time()
+            if now - last_no_patient_alert >= NO_PATIENT_INTERVAL:
+                speak("Confusing in patient detection")
+                last_no_patient_alert = now
+
+        # ── SINGLE BOX → always this is the patient ────────────────
+        elif num_boxes == 1:
+            x1, y1, x2, y2 = rects[0]
+            cx         = int((x1+x2)/2)
+            cy         = int((y1+y2)/2)
+            box_height = y2 - y1
+            box_width  = x2 - x1
+            fall_detected = box_width >= box_height
+
+            if not locked:
+                locked_id            = list(objects.keys())[0]
+                locked               = True
+                tracker.protected_id = locked_id
+                print(f"PATIENT LOCKED → ID = {locked_id}")
+
+            lost_alert_count = 0
+            patient_found = True
+
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,0,255), 3)
+            cv2.circle(frame, (cx,cy), 5, (0,255,255), -1)
+
+            cv2.putText(frame,
+                        f"H={box_height} W={box_width}",
+                        (x1 + 4, y1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.60, (0,255,255), 2)
+
+            label_text = "FALL DETECTED!" if fall_detected else "PATIENT"
+            cv2.putText(frame,
+                        label_text,
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0,0,255), 2)
+
+            if fall_detected:
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (x1,y1), (x2,y2), (0,0,255), -1)
+                cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+
+            # ── TURNING LOGIC (MIRROR FIXED) ──────────────────────
+            # Human on LEFT  side of camera → robot turns LEFT  to follow
+            # Human on RIGHT side of camera → robot turns RIGHT to follow
+            if cx < far_l_x:
+                # Human far left on camera → strong left turn
+                cmd      = "STRONG LEFT"
+                turn_str = TURN_STRONG
+                smooth_left(turn_str)
+            elif cx < near_l_x:
+                # Human gentle left on camera → gentle left turn
+                cmd      = "GENTLE LEFT"
+                turn_str = TURN_GENTLE
+                smooth_left(turn_str)
+            elif cx > far_r_x:
+                # Human far right on camera → strong right turn
+                cmd      = "STRONG RIGHT"
+                turn_str = TURN_STRONG
+                smooth_right(turn_str)
+            elif cx > near_r_x:
+                # Human gentle right on camera → gentle right turn
+                cmd      = "GENTLE RIGHT"
+                turn_str = TURN_GENTLE
+                smooth_right(turn_str)
+            else:
+                # CENTER ZONE (30–70%) → fwd / stop / back by height
+                if fall_detected:
+                    cmd = "FALL DETECTED"
+                    stop()
+                elif box_height < 500:
+                    cmd = "FORWARD"
+                    forward(28)
+                elif box_height > 510:
+                    cmd = "BACKWARD"
+                    backward(28)
+                else:
+                    cmd = "STOP"
+                    stop()
+
+            cv2.putText(frame,
+                        "Thresholds: FWD<500 | STOP 500-510 | BACK>510",
+                        (5, h - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42, (200,200,200), 1)
+
+        # ── CONFUSION: draw unknown boxes ─────────────────────────
+        if confusion_alert:
+            for object_id, centroid in objects.items():
+                min_dist, best_bbox = float("inf"), None
+                for (bx1, by1, bx2, by2) in rects:
+                    bcx = int((bx1+bx2)/2)
+                    bcy = int((by1+by2)/2)
+                    d   = np.sqrt((centroid[0]-bcx)**2 + (centroid[1]-bcy)**2)
+                    if d < min_dist:
+                        min_dist  = d
+                        best_bbox = (bx1, by1, bx2, by2)
+                if best_bbox is None:
+                    continue
+                bx1, by1, bx2, by2 = best_bbox
+                cv2.rectangle(frame, (bx1,by1), (bx2,by2), (0,255,255), 2)
+                cv2.putText(frame, "?",
+                            (bx1, by1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (0,255,255), 2)
+
+        # ── NO PATIENT VISIBLE → STOP + TTS ALERT ─────────────────
+        if not patient_found:
+            stop()
+
+            if locked:
+                cmd = "PATIENT LOST"
+                now = time.time()
+                if (lost_alert_count < 3 and
+                        now - last_no_patient_alert >= NO_PATIENT_INTERVAL):
+                    speak("Patient is not in frame")
+                    last_no_patient_alert = now
+                    lost_alert_count += 1
+            else:
+                cmd = "WAITING..."
+
+        # ── HUD ──────────────────────────────────────────────────
+        color_map = {
+            "FORWARD":      (0,255,0),
+            "BACKWARD":     (0,128,255),
+            "STOP":         (255,255,0),
+            "GENTLE LEFT":  (255,200,0),
+            "STRONG LEFT":  (255,100,0),
+            "GENTLE RIGHT": (200,255,0),
+            "STRONG RIGHT": (100,255,0),
+            "PATIENT LOST": (0,0,255),
+            "WAITING...":   (180,180,180),
+            "CONFUSION":    (0,165,255),
+            "FALL DETECTED":(0,0,255),
+        }
+        hud_color = color_map.get(cmd, (255,255,255))
+
+        cv2.putText(frame,
+                    f"CMD: {cmd}",
+                    (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.85, hud_color, 2)
+
+        cv2.imshow("Patient Follower Robot", frame)
+
+        if cv2.waitKey(1) == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    stop()
+    cv2.destroyAllWindows()
+    picam2.stop()
+    GPIO.cleanup()
+    print("Stopped.")
