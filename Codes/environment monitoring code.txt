@@ -1,0 +1,157 @@
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <ESP32Servo.h>
+#include <DHT.h>
+
+// -------- WIFI --------
+const char* ssid = "haris";
+const char* password = "12345677";
+
+// -------- FIREBASE --------
+#define FIREBASE_HOST "monitoring-f740a-default-rtdb.asia-southeast1.firebasedatabase.app"
+// Use your **Database Secret (legacy token)** here
+#define FIREBASE_AUTH "YOUR_DATABASE_SECRET_HERE"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+FirebaseJson json;
+
+// -------- PINS --------
+#define TRIG_PIN 15
+#define ECHO_PIN 18
+#define SERVO_PIN 22
+#define DHT_PIN 4
+#define MQ2_PIN 32
+#define MQ5_PIN 34
+
+#define DHT_TYPE DHT11
+
+Servo myServo;
+DHT dht(DHT_PIN, DHT_TYPE);
+
+long duration;
+float distance;
+int angle = 0;
+int stepAngle = 3;
+
+void setup() {
+  Serial.begin(115200);
+
+  // -------- WIFI --------
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+    retry++;
+    if (retry > 20) {
+      Serial.println("\n❌ WiFi Failed!");
+      Serial.println("Check SSID / Password / Signal");
+      return;
+    }
+  }
+  Serial.println("\n✅ Connected to WiFi");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  // -------- FIREBASE --------
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH; // use database secret
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // -------- SENSORS --------
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  myServo.attach(SERVO_PIN);
+  dht.begin();
+  pinMode(MQ2_PIN, INPUT);
+  pinMode(MQ5_PIN, INPUT);
+
+  Serial.println("✅ System Initialized");
+
+  // -------- DEBUG --------
+  if (Firebase.ready()) {
+    Serial.println("✅ Firebase ready");
+  } else {
+    Serial.println("❌ Firebase NOT ready");
+    Serial.println(fbdo.errorReason()); // corrected error call
+  }
+}
+
+void loop() {
+  // -------- ULTRASONIC --------
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  distance = (duration != 0) ? (duration * 0.0343) / 2 : -1;
+
+  // -------- SERVO --------
+  myServo.write(angle);
+  angle += stepAngle;
+  if (angle >= 180 || angle <= 0) stepAngle = -stepAngle;
+
+  // -------- DHT --------
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+
+  // -------- MQ SENSORS --------
+  int mq2Value = analogRead(MQ2_PIN);
+  int mq5Value = analogRead(MQ5_PIN);
+
+  // -------- ALERT LOGIC --------
+  String alert = "Normal";
+  int smokeStatus = 0;
+  int gasStatus = 0;
+
+  if (mq2Value > 800) { alert = "Smoke Detected"; smokeStatus = 1; }
+  if (mq5Value > 3500) { alert = "Gas Leakage Detected"; gasStatus = 1; }
+
+  // -------- JSON BUILD --------
+  json.clear();
+  json.set("temperature", temp);
+  json.set("humidity", hum);
+  json.set("distance", distance);
+  json.set("mq2", mq2Value);
+  json.set("mq5", mq5Value);
+  json.set("servo", angle);
+  json.set("alert", alert);
+  json.set("smoke_status", smokeStatus);
+  json.set("gas_status", gasStatus);
+
+  // -------- FIREBASE SEND --------
+  if (Firebase.ready()) {
+    if (!Firebase.updateNode(fbdo, "/esp32", json)) {
+      Serial.println("❌ Error sending to /esp32:");
+      Serial.println(fbdo.errorReason());
+    } else { Serial.println("✅ Sent to /esp32"); }
+
+    if (!Firebase.updateNode(fbdo, "/sensor", json)) {
+      Serial.println("❌ Error sending to /sensor:");
+      Serial.println(fbdo.errorReason());
+    } else { Serial.println("✅ Sent to /sensor"); }
+
+  } else {
+    Serial.println("❌ Firebase NOT ready");
+  }
+
+  // -------- SERIAL OUTPUT --------
+  Serial.println("----- Data Sent (JSON) -----");
+  Serial.print("Temp: "); Serial.println(temp);
+  Serial.print("Humidity: "); Serial.println(hum);
+  Serial.print("Distance: "); Serial.println(distance);
+  Serial.print("MQ2: "); Serial.println(mq2Value);
+  Serial.print("MQ5: "); Serial.println(mq5Value);
+  Serial.print("Servo: "); Serial.println(angle);
+  Serial.print("Alert: "); Serial.println(alert);
+  Serial.println("----------------------------");
+
+  delay(2000);
+}

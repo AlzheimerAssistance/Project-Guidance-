@@ -1,0 +1,813 @@
+# ============================================================
+# FALL DETECTION — Raspberry Pi  (Pi Camera + YOLOv8n-pose)
+# ============================================================
+# Fall logic  : Colab v3 full 4-state machine
+#               UPRIGHT → MOTION → FALLEN / SLEEPING
+#               (velocity spike + body angle + peak detection)
+# Visualization: full overlay (state, metrics, skeleton, CoG)
+# Camera      : Picamera2
+# Model       : yolov8n-pose.pt
+# TTS         : espeak → Bluetooth speaker (PulseAudio)
+# STT         : Vosk (fully offline) → USB microphone
+# ============================================================
+
+from ultralytics import YOLO
+from picamera2 import Picamera2
+import cv2
+import time
+import os
+import json
+import queue
+import threading
+import numpy as np
+import sounddevice as sd
+from vosk import Model as VoskModel, KaldiRecognizer
+from collections import deque
+from firebase_config import send_fall_alert
+# ================================
+# LOAD MODEL
+# ================================
+model = YOLO("yolov8n-pose.pt")
+
+# ================================
+# LOAD VOSK STT MODEL
+# ================================
+import os
+from vosk import Model as VoskModel
+
+VOSK_MODEL_PATH = "/home/raspberryi5/fyp_project/vosk-model-small-en-us-0.15"
+
+print(f"🧠 Loading Vosk STT model from: {VOSK_MODEL_PATH}")
+
+if not os.path.exists(VOSK_MODEL_PATH):
+    raise FileNotFoundError(
+        f"\n❌ Vosk model not found at: {VOSK_MODEL_PATH}\n"
+        "Make sure it is extracted inside fyp_project folder.\n"
+    )
+
+_vosk_model = VoskModel(VOSK_MODEL_PATH)
+
+print("✓ Vosk STT model loaded successfully!")
+# ================================
+# CAMERA SETUP
+# ================================
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(
+    main={"size": (640, 480)}
+))
+picam2.start()
+time.sleep(2)
+print("🚀 Starting Fall Detection System...")
+
+
+# ================================
+# TTS — Bluetooth Speaker via espeak + PulseAudio
+# ================================
+# Uses the exact method you already tested successfully:
+#   paplay  → wakes up Bluetooth audio pipeline
+#   espeak  → speaks the message through BT speaker
+#
+# robot_speak() is BLOCKING — it waits until speech finishes
+# before returning, so the fall interaction flow stays sequential.
+
+def robot_speak(text, retries=2):
+    """
+    Speak text through paired Bluetooth speaker.
+    Tries up to `retries` times if audio pipeline is sleeping.
+    """
+    print(f"\n🤖 Robot says: \"{text}\"")
+    for attempt in range(retries):
+        try:
+            # Wake up Bluetooth audio pipeline (same as your tested code)
+            os.system("paplay /usr/share/sounds/alsa/Front_Center.wav 2>/dev/null")
+            time.sleep(0.3)
+            # Speak — female voice, high volume, normal speed
+            safe_text = text.replace('"', "'")
+            ret = os.system(f'espeak -ven+f3 -a 200 -s 165 "{safe_text}"')
+            if ret == 0:
+                return   # success
+        except Exception as e:
+            print(f"⚠️  TTS attempt {attempt+1} error: {e}")
+        time.sleep(0.5)
+    print("⚠️  TTS failed after all retries — continuing silently.")
+
+
+# ================================
+# STT — Vosk (offline) → USB Microphone
+# ================================
+# Fully offline — no internet needed.
+# Uses sounddevice to capture from USB mic
+# and Vosk to transcribe locally on Pi 5.
+#
+# HOW IT WORKS:
+#   - Opens USB mic stream via sounddevice
+#   - Feeds audio chunks to KaldiRecognizer in real time
+#   - Stops as soon as a COMPLETE sentence is recognised
+#     (Vosk calls AcceptWaveform=True) OR timeout is reached
+#   - Returns the best transcript it found
+
+def listen_patient(timeout_seconds=8):
+    """
+    Records from USB microphone and transcribes with Vosk.
+    Stops early as soon as patient finishes speaking.
+    Returns transcript string, or 'UNCLEAR' on silence/error.
+    """
+    print(f"\n🎤 Listening for patient (max {timeout_seconds}s)... speak now!")
+
+    audio_q    = queue.Queue()
+    recognizer = KaldiRecognizer(_vosk_model, 16000)
+    transcript = ""
+    stop_evt   = threading.Event()
+
+    def _mic_callback(indata, frames, time_info, status):
+        if not stop_evt.is_set():
+            audio_q.put(bytes(indata))
+
+    try:
+        with sd.RawInputStream(samplerate=16000,
+                               blocksize=8000,
+                               dtype='int16',
+                               channels=1,
+                               callback=_mic_callback):
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                try:
+                    data = audio_q.get(timeout=0.3)
+                    if recognizer.AcceptWaveform(data):
+                        # Complete utterance recognised — grab it and stop early
+                        result = json.loads(recognizer.Result())
+                        text   = result.get("text", "").strip()
+                        if text:
+                            transcript = text
+                            break          # stop listening, we have a result
+                except queue.Empty:
+                    pass
+
+        stop_evt.set()
+
+        # If no complete utterance yet, grab whatever partial Vosk has
+        if not transcript:
+            final = json.loads(recognizer.FinalResult())
+            transcript = final.get("text", "").strip()
+
+        if transcript:
+            print(f"🗣️  Patient said: \"{transcript}\"")
+            return transcript
+        else:
+            print("⚠️  No speech detected.")
+            return "UNCLEAR"
+
+    except Exception as e:
+        stop_evt.set()
+        print(f"⚠️  Mic/Vosk error: {e}")
+        return "UNCLEAR"
+
+
+def detect_patient_intent(transcript):
+    """Parse transcript into FINE / HELP / UNCLEAR."""
+    if not transcript or transcript in ("UNCLEAR", "TIMEOUT", "") \
+            or transcript.startswith("ERROR"):
+        return "UNCLEAR"
+    text = transcript.lower().strip()
+    help_kw = ['help','need help','please help','not fine','not okay',
+               "i'm not",'i am not','not ok','not good','hurt','pain',
+               'fallen','call','emergency','assist','yes']
+    fine_kw = ['fine','okay','ok','good','alright','all right',
+               'no help','no need',"don't need","i'm fine",'i am fine',
+               'no problem','i am okay',"i'm okay",'no issue','nothing']
+    for kw in help_kw:
+        if kw in text:
+            return 'HELP'
+    for kw in fine_kw:
+        if kw in text:
+            return 'FINE'
+    return 'UNCLEAR'
+
+
+# ================================
+# FALL SPEECH INTERACTION
+# ================================
+FALL_SPEAK_TEXT = (
+    "Hey, are you okay? "
+    "Do you need any help? "
+    "Kindly tell me, I am here to assist you."
+)
+
+def handle_fall_response(detector, frame_img, fw, fh):
+    """
+    Called once fall is confirmed (FALL_CONFIRM_FRAMES consecutive FALLEN frames).
+
+    FLOW:
+      1. Show FALL DETECTED alert on screen
+      2. Speak FALL_SPEAK_TEXT through Bluetooth speaker
+      3. Listen via USB microphone → Vosk transcription
+      4. Check intent:
+           FINE    → "okay i understand you don't need any help,
+                       let me continue to monitor you"
+                    → reset all buffers → RESUME monitoring
+           HELP    → "okay i understand you need help,
+                       let me notify to your caregiver"
+                    → send alert → RESUME monitoring
+           UNCLEAR → ask again (up to MAX_ASK_ATTEMPTS)
+      5. No response after MAX_ASK_ATTEMPTS → safe default = HELP
+
+    Returns: "RESUME" or "ALERTED"
+    — in BOTH cases monitoring always continues —
+    """
+    MAX_ASK_ATTEMPTS = 5
+
+    print("\n" + "="*60)
+    print("🚨 FALL CONFIRMED — SPEECH INTERACTION STARTED")
+    print("="*60)
+
+    # ── Visual alert on frame ──────────────────────────────
+    alert = frame_img.copy()
+    cv2.putText(alert, "FALL DETECTED!",
+                (fw//2-160, fh//2-60),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
+    cv2.putText(alert, "Speaking to patient...",
+                (fw//2-180, fh//2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,220,255), 2)
+    cv2.imshow("Fall Detection System", alert)
+    cv2.waitKey(1)
+
+    # ── Keep asking until patient responds or attempts exhausted ──
+    for attempt in range(1, MAX_ASK_ATTEMPTS + 1):
+        print(f"\n🔁 Attempt {attempt}/{MAX_ASK_ATTEMPTS}")
+
+        # Speak through Bluetooth speaker
+        robot_speak(FALL_SPEAK_TEXT)
+
+        # Listen via USB mic → Vosk STT
+        transcript = listen_patient(timeout_seconds=8)
+        intent     = detect_patient_intent(transcript)
+
+        print(f"   Transcript : '{transcript}'")
+        print(f"   Intent     : {intent}")
+
+        # ── Patient is FINE ───────────────────────────────
+        if intent == "FINE":
+            print("\n✅ Patient is fine — resuming monitoring.")
+            robot_speak(
+                "Okay, I understand you don't need any help. "
+                "Let me continue to monitor you."
+            )
+            detector.reset_after_patient_fine()
+            # Show resume message on screen
+            resume_frame = frame_img.copy()
+            cv2.putText(resume_frame, "PATIENT IS FINE",
+                        (fw//2-160, fh//2-60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3)
+            cv2.putText(resume_frame, "Monitoring resumed...",
+                        (fw//2-160, fh//2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+            cv2.imshow("Fall Detection System", resume_frame)
+            cv2.waitKey(1)
+            return "RESUME"
+
+        # ── Patient NEEDS HELP ────────────────────────────
+        elif intent == "HELP":
+            print("\n🚨 Patient needs help!")
+            robot_speak(
+                "Okay, I understand you need help. "
+                "Let me notify to your caregiver."
+            )
+            _send_alert(frame_img, fw, fh, transcript, intent)
+            # Monitoring always continues after alert
+            return "ALERTED"
+
+        # ── Unclear — ask again ───────────────────────────
+        else:
+            print(f"   ⚠️  No clear response — asking again...")
+            if attempt < MAX_ASK_ATTEMPTS:
+                robot_speak(
+                    "I did not hear you clearly. "
+                    "Please say: I am fine, or I need help."
+                )
+
+    # ── No response after all attempts — safe default = HELP ──
+    print("\n⚠️  No response after all attempts — defaulting to HELP (safe).")
+    robot_speak(
+        "Okay, I understand you need help. "
+        "Let me notify to your caregiver."
+    )
+    _send_alert(frame_img, fw, fh, "NO RESPONSE", "UNCLEAR→HELP")
+    return "ALERTED"
+
+
+def _send_alert(frame_img, fw, fh, transcript, intent):
+    """Logs caregiver alert and shows it on screen."""
+    alert_time = time.strftime("%H:%M:%S")
+    print(f"\n📢 CAREGIVER ALERT SENT — {alert_time}")
+    print(f"   Transcript : '{transcript}'")
+    print(f"   Intent     : {intent}")
+
+    alert2 = frame_img.copy()
+    cv2.putText(alert2, "ALERT SENT!",
+                (fw//2-130, fh//2-60),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0,0,255), 4)
+    cv2.putText(alert2, f"Time: {alert_time}",
+                (fw//2-100, fh//2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
+    cv2.putText(alert2, "Monitoring continues...",
+                (fw//2-160, fh//2+50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,220,255), 2)
+    cv2.imshow("Fall Detection System", alert2)
+    cv2.waitKey(1)
+
+
+# ================================
+# FALL DETECTOR CLASS
+# — logic ported from Colab v3 FrameAnalyzer —
+# ================================
+class FallDetector:
+    def __init__(self, buffer_size=10):
+        # ── metric history buffers ───────────────────────────
+        self.buffer_size      = buffer_size
+        self.cog_history      = deque(maxlen=buffer_size)
+        self.angle_history    = deque(maxlen=buffer_size)
+        self.velocity_history = deque(maxlen=buffer_size)
+
+        # ── velocity buffers (Colab logic) ───────────────────
+        self.cog_y_buffer    = deque(maxlen=60)
+        self.velocity_buffer = deque(maxlen=60)
+
+        # ── thresholds (exact from Colab v3) ─────────────────
+        self.VELOCITY_WINDOW              = 8
+        self.VELOCITY_THRESHOLD           = 15.0
+        self.STILLNESS_THRESHOLD          = 3.5
+        self.HISTORY_WINDOW               = 45
+        self.FALL_CONFIRM_FRAMES          = 8
+        self.FALL_PEAK_VELOCITY_THRESHOLD = 20.0
+
+        # ── state machine ────────────────────────────────────
+        self.state                   = "UPRIGHT"
+        self.prev_state              = "UPRIGHT"
+        self.spike_frame             = None
+        self.frames_in_state         = 0   # renamed from frames_in_current_state
+        self.fall_confirmed_count    = 0
+
+    # ── full buffer reset (called when patient says "I'm fine") ──
+    def reset_after_patient_fine(self):
+        self.cog_y_buffer.clear()
+        self.velocity_buffer.clear()
+        self.velocity_history.clear()
+        self.cog_history.clear()
+        self.angle_history.clear()
+        self.state                = "UPRIGHT"
+        self.prev_state           = "UPRIGHT"
+        self.spike_frame          = None
+        self.frames_in_state      = 0
+        self.fall_confirmed_count = 0
+        print("✅ All buffers cleared — state reset to UPRIGHT")
+        print("▶️  Monitoring resumed from clean state")
+
+    # ── CoG (centre of gravity) ──────────────────────────────
+    def get_cog(self, kps, conf=0.35):
+        ls, rs = kps[5], kps[6]
+        lh, rh = kps[11], kps[12]
+        if min(ls[2], rs[2], lh[2], rh[2]) < conf:
+            return None
+        cx = (ls[0] + rs[0] + lh[0] + rh[0]) / 4
+        cy = (ls[1] + rs[1] + lh[1] + rh[1]) / 4
+        return int(cx), int(cy)
+
+    # ── windowed velocity (Colab v3 method) ─────────────────
+    def calculate_windowed_velocity(self, current_cog_y):
+        self.cog_y_buffer.append(current_cog_y)
+        if len(self.cog_y_buffer) < 2:
+            return 0.0
+        window = min(self.VELOCITY_WINDOW, len(self.cog_y_buffer))
+        recent = list(self.cog_y_buffer)[-window:]
+        velocity = abs(recent[-1] - recent[0]) / max(window - 1, 1)
+        self.velocity_buffer.append(velocity)
+        return velocity
+
+    def get_peak_velocity_in_history(self):
+        if not self.velocity_buffer:
+            return 0.0
+        history = list(self.velocity_buffer)[-self.HISTORY_WINDOW:]
+        return max(history) if history else 0.0
+
+    # ── body angle (shoulder→hip) ─────────────────────────
+    def get_body_angle(self, kps, conf=0.35):
+        ls, rs = kps[5],  kps[6]
+        lh, rh = kps[11], kps[12]
+        if min(ls[2], rs[2], lh[2], rh[2]) < conf:
+            return None
+        sc = np.array([(ls[0]+rs[0])/2, (ls[1]+rs[1])/2])
+        hc = np.array([(lh[0]+rh[0])/2, (lh[1]+rh[1])/2])
+        dx, dy = hc[0]-sc[0], hc[1]-sc[1]
+        if abs(dx) < 1e-5:
+            return 90.0 if dy > 0 else -90.0
+        return float(np.degrees(np.arctan2(abs(dy), abs(dx))))
+
+    def get_shoulder_hip_diff(self, kps, conf=0.35):
+        ls, rs = kps[5],  kps[6]
+        lh, rh = kps[11], kps[12]
+        if min(ls[2], rs[2], lh[2], rh[2]) < conf:
+            return None
+        return float(((lh[1]+rh[1])/2) - ((ls[1]+rs[1])/2))
+
+    def get_hw_ratio(self, kps, conf=0.35):
+        kp   = np.asarray(kps)
+        mask = kp[:, 2] > conf
+        if mask.sum() < 4:
+            return None
+        pts = kp[mask, :2]
+        w   = pts[:, 0].max() - pts[:, 0].min()
+        h   = pts[:, 1].max() - pts[:, 1].min()
+        return float(h / w) if w > 0 else None
+
+    # ── risk score (4 states) ─────────────────────────────
+    def get_risk_score(self):
+        return {"FALLEN": 80, "MOTION": 45, "SLEEPING": 5, "UPRIGHT": 0}.get(self.state, 0)
+
+    # ── 4-STATE MACHINE (ported exactly from Colab v3) ──────
+    #
+    #   UPRIGHT  ──fast──►  MOTION  ──horiz+still+spike──►  FALLEN
+    #      ▲                  │                                 │
+    #      │                  └──horiz+still+no-spike──► SLEEPING
+    #      └──────────────────────────────────upright───────────┘
+    #
+    def update_state(self, current_velocity, body_angle, frame_num):
+        is_horizontal = (body_angle is not None and body_angle < 45)
+        is_upright    = (body_angle is not None and body_angle > 60)
+        is_still      = (current_velocity < self.STILLNESS_THRESHOLD)
+        is_fast       = (current_velocity > self.VELOCITY_THRESHOLD)
+        peak_vel      = self.get_peak_velocity_in_history()
+        had_big_spike = (peak_vel > self.FALL_PEAK_VELOCITY_THRESHOLD)
+
+        self.prev_state = self.state
+
+        if self.state == "UPRIGHT":
+            if is_fast:
+                self.state       = "MOTION"
+                self.spike_frame = frame_num
+                self.frames_in_state      = 0
+                self.fall_confirmed_count = 0
+            elif is_horizontal and is_still and not had_big_spike:
+                self.state           = "SLEEPING"
+                self.frames_in_state = 0
+
+        elif self.state == "MOTION":
+            self.frames_in_state += 1
+            if is_horizontal and is_still and had_big_spike:
+                self.state                = "FALLEN"
+                self.frames_in_state      = 0
+                self.fall_confirmed_count = 0
+            elif is_horizontal and is_still and not had_big_spike:
+                self.state           = "SLEEPING"
+                self.frames_in_state = 0
+            elif not is_fast and not is_horizontal:
+                self.state           = "UPRIGHT"
+                self.frames_in_state = 0
+
+        elif self.state == "FALLEN":
+            self.frames_in_state      += 1
+            self.fall_confirmed_count += 1
+            if is_upright:
+                self.state            = "UPRIGHT"
+                self.spike_frame      = None
+                self.frames_in_state  = 0
+                self.fall_confirmed_count = 0
+
+        elif self.state == "SLEEPING":
+            self.frames_in_state += 1
+            if is_upright:
+                self.state           = "UPRIGHT"
+                self.frames_in_state = 0
+            elif is_fast:
+                self.state           = "MOTION"
+                self.spike_frame     = frame_num
+                self.frames_in_state = 0
+
+        # catch-all: if horizontal+still+no-spike from any state → SLEEPING
+        if (self.state not in ("FALLEN", "MOTION") and
+                is_horizontal and is_still and not had_big_spike):
+            self.state = "SLEEPING"
+
+        return self.state
+
+    # ── single entry point called from main loop ─────────────
+    def process_frame(self, kps, frame_num):
+        """
+        Computes CoG, windowed velocity, body angle,
+        runs the 4-state machine, and returns (state, velocity, peak_vel).
+        """
+        cog = self.get_cog(kps)
+        if cog is None:
+            return self.state, 0.0, 0.0
+
+        _, cy        = cog
+        velocity     = self.calculate_windowed_velocity(cy)
+        body_angle   = self.get_body_angle(kps)
+
+        if body_angle is not None:
+            self.angle_history.append(body_angle)
+
+        self.velocity_history.append(velocity)
+        self.cog_history.append(cog)
+
+        new_state = self.update_state(velocity, body_angle, frame_num)
+        return new_state, velocity, self.get_peak_velocity_in_history()
+
+
+# ================================
+# VISUALIZATION
+# ================================
+CONF_THRESH = 0.35
+
+KP_COLORS = {
+    5:(255,0,255), 6:(255,0,255),    # shoulders — magenta
+    11:(0,255,0),  12:(0,255,0),     # hips      — green
+    13:(0,255,255),14:(0,255,255),   # knees     — cyan
+    15:(0,165,255),16:(0,165,255),   # ankles    — orange
+}
+KP_LABELS = {5:'S',6:'S',11:'H',12:'H',13:'K',14:'K',15:'A',16:'A'}
+
+SKELETON = [
+    (0,1),(0,2),(1,3),(2,4),
+    (5,6),(5,7),(6,8),(7,9),(8,10),
+    (11,12),(11,13),(12,14),(13,15),(14,16)
+]
+
+STATE_COLORS = {
+    "UPRIGHT":  (0,255,0),
+    "MOTION":   (0,165,255),
+    "FALLEN":   (0,0,255),
+    "SLEEPING": (0,220,255),
+}
+STATE_BAR = {
+    "UPRIGHT":  ((0,80,0),   (0,255,0),   "UPRIGHT — STABLE"),
+    "MOTION":   ((0,40,100), (0,165,255), "MOTION — MONITORING"),
+    "FALLEN":   ((0,0,100),  (0,0,255),   "FALL DETECTED — SPEAKING TO PATIENT"),
+    "SLEEPING": ((60,50,0),  (0,220,255), "SLEEPING — NO ALERT"),
+}
+
+
+def draw_overlay(frame, kps, detector, frame_num, timestamp,
+                 velocity=0.0, peak_vel=0.0, bbox_info=None):
+    fh, fw = frame.shape[:2]
+
+    # ── Bounding box + H/W labels ────────────────────────────
+    if bbox_info is not None:
+        x1,y1,x2,y2 = [int(v) for v in bbox_info]
+        bw, bh = x2-x1, y2-y1
+        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 3)
+        for txt, pos in [
+            (f"H:{bh}px", (x1, y1-10)),
+            (f"W:{bw}px", ((x1+x2)//2-30, y1-40)),
+        ]:
+            ts = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(frame,(pos[0]-3,pos[1]-18),(pos[0]+ts[0]+3,pos[1]+3),(0,0,0),-1)
+            cv2.putText(frame, txt, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+    # ── Skeleton lines ───────────────────────────────────────
+    for i1,i2 in SKELETON:
+        if i1 < len(kps) and i2 < len(kps):
+            x1k,y1k,c1 = kps[i1]
+            x2k,y2k,c2 = kps[i2]
+            if c1 > CONF_THRESH and c2 > CONF_THRESH:
+                cv2.line(frame,(int(x1k),int(y1k)),(int(x2k),int(y2k)),(255,255,0),2)
+
+    # ── Keypoint dots + labels ───────────────────────────────
+    for i,(x,y,conf) in enumerate(kps):
+        if conf > CONF_THRESH:
+            color = KP_COLORS.get(i, (0,0,255))
+            label = KP_LABELS.get(i, str(i))
+            cv2.circle(frame, (int(x),int(y)), 6, color, -1)
+            ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(frame,
+                          (int(x)-ts[0]//2-2, int(y)-25),
+                          (int(x)+ts[0]//2+2, int(y)-10),
+                          (0,0,0), -1)
+            cv2.putText(frame, label,
+                        (int(x)-ts[0]//2, int(y)-12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    # ── Top header bar ───────────────────────────────────────
+    hbg = np.zeros((60, fw, 3), dtype=np.uint8)
+    hbg[:, :] = (30,30,30)
+    frame[0:60, 0:fw] = cv2.addWeighted(frame[0:60,0:fw], 0.3, hbg, 0.7, 0)
+    cv2.putText(frame, f"FRAME {frame_num} | T:{timestamp:.1f}s",
+                (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+    # ── Metrics panel (left side) ────────────────────────────
+    pw     = 375
+    mpanel = np.zeros((fh-100, pw, 3), dtype=np.uint8)
+    mpanel[:,:] = (20,20,20)
+    frame[100:fh, 20:20+pw] = cv2.addWeighted(
+        frame[100:fh, 20:20+pw], 0.3, mpanel, 0.7, 0)
+
+    def row(label, val, color, yp):
+        cv2.putText(frame, f"{label}:", (30,yp),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255,255,255), 1)
+        cv2.putText(frame, val, (210,yp),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.56, color, 2)
+
+    cs    = detector.state
+    sc    = STATE_COLORS.get(cs, (255,255,255))
+    y     = 85
+    lh_px = 25
+
+    # STATE
+    cv2.putText(frame, f"STATE: {cs}", (30,y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, sc, 2)
+    y += lh_px + 4
+
+    # Frames in state
+    row("Frames in state", str(detector.frames_in_state), (200,200,200), y)
+    y += lh_px
+
+    # CoG velocity  (from process_frame return value — accurate windowed vel)
+    vc = (0,0,255) if velocity>15 else (0,165,255) if velocity>5 else (0,255,0)
+    row("CoG Vel", f"{velocity:.1f} px/f", vc, y)
+    y += lh_px
+
+    # Peak velocity
+    pvc = (0,0,255) if peak_vel>25 else (0,165,255) if peak_vel>15 else (0,255,0)
+    pvl = "FALL!" if peak_vel>25 else "MOTION" if peak_vel>15 else "OK"
+    row("Peak vel", f"{peak_vel:.1f} [{pvl}]", pvc, y)
+    y += lh_px
+
+    # Body angle
+    ang = detector.get_body_angle(kps)
+    if ang is not None:
+        ac  = (0,255,0) if ang>70 else (0,255,255) if ang>45 else (0,0,255)
+        ast = "UPRIGHT" if ang>70 else "LEAN" if ang>45 else "HORIZ"
+        row("Body Angle", f"{ang:.1f}deg ({ast})", ac, y)
+        y += lh_px
+
+    # Shoulder-hip diff
+    sh = detector.get_shoulder_hip_diff(kps)
+    if sh is not None:
+        shc = (0,0,255) if sh<0 else (0,255,255) if sh<20 else (0,255,0)
+        row("S-H Diff", f"{sh:.1f}px", shc, y)
+        y += lh_px
+
+    # H/W ratio
+    hw = detector.get_hw_ratio(kps)
+    if hw is not None:
+        hwc = (0,255,0) if hw>2 else (0,255,255) if hw>1 else (0,0,255)
+        row("H/W Ratio", f"{hw:.2f}", hwc, y)
+        y += lh_px
+
+    # Risk score
+    rs  = detector.get_risk_score()
+    rsc = (0,0,255) if rs>60 else (0,165,255) if rs>30 else (0,255,0)
+    row("Risk Score", f"{rs}/100", rsc, y)
+
+    # ── Risk factors panel (right side) — shown when FALLEN ──
+    risk_factors = []
+    if cs == "FALLEN":
+        risk_factors.append(f"FALLEN (peak {peak_vel:.1f} > {detector.FALL_PEAK_VELOCITY_THRESHOLD})")
+    if ang is not None and ang < 45:
+        risk_factors.append(f"Horizontal: {ang:.1f}deg")
+    if sh is not None and sh < 0:
+        risk_factors.append(f"S<H: {-sh:.1f}px")
+    if hw is not None and hw < 1.0:
+        risk_factors.append(f"Low H/W: {hw:.2f}")
+    if velocity > detector.VELOCITY_THRESHOLD:
+        risk_factors.append(f"Rapid CoG: {velocity:.1f} px/f")
+
+    if risk_factors:
+        rpx = fw - 355
+        rp  = np.zeros((fh-100, 340, 3), dtype=np.uint8)
+        rp[:,:] = (35,0,0)
+        frame[100:fh, rpx-5:rpx+335] = cv2.addWeighted(
+            frame[100:fh, rpx-5:rpx+335], 0.3, rp, 0.7, 0)
+        cv2.putText(frame, "RISK FACTORS:", (rpx,120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,255), 2)
+        yr = 148
+        for fac in risk_factors[:5]:
+            cv2.putText(frame, f"  {fac}", (rpx,yr),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255,255,255), 1)
+            yr += 27
+
+    # ── CoG dot on frame ────────────────────────────────────
+    cog = detector.get_cog(kps)
+    if cog is not None:
+        cx, cy_v = cog
+        cv2.circle(frame, (cx, cy_v), 15, sc, -1)
+        cv2.circle(frame, (cx, cy_v), 20, sc,  3)
+        cv2.line(frame,   (cx, cy_v), (cx, fh), (255,255,0), 2)
+        cv2.putText(frame, "CoG", (cx-15, cy_v-28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, sc, 2)
+
+    # ── Bottom status bar ────────────────────────────────────
+    sbh = 45
+    bg_c, txt_c, txt = STATE_BAR.get(cs, ((0,80,0),(0,255,0),"STABLE"))
+    sb = np.zeros((sbh, fw, 3), dtype=np.uint8)
+    sb[:,:] = bg_c
+    by = fh - sbh
+    frame[by:fh, 0:fw] = cv2.addWeighted(frame[by:fh,0:fw], 0.3, sb, 0.7, 0)
+    cv2.putText(frame, txt, (fw//2-200, fh-14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.72, txt_c, 2)
+
+    # ── Frame counter box top-right ──────────────────────────
+    fc_txt = f"Frame: {frame_num}"
+    ts2    = cv2.getTextSize(fc_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    cv2.rectangle(frame, (fw-ts2[0]-30,15), (fw-10,45), (0,0,0), -1)
+    cv2.putText(frame, fc_txt, (fw-ts2[0]-20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+    return frame
+
+
+# ================================
+# MAIN LOOP
+# ================================
+detector  = FallDetector()
+frame_num = 0
+start_t   = time.time()
+
+# fall confirmation tracking (mirrors Colab v3 speech trigger)
+risk_frames    = []
+speech_pending = False
+FALL_CONFIRM_FRAMES = detector.FALL_CONFIRM_FRAMES
+
+print("Press 'q' to quit.")
+
+while True:
+    frame = picam2.capture_array()
+
+    # Convert RGBA → BGR if needed
+    if frame.shape[2] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+    # YOLO inference
+    results   = model(frame, verbose=False)
+    timestamp = time.time() - start_t
+
+    state     = "NO PERSON"
+    bbox_info = None
+    kps_draw  = None
+    velocity  = 0.0
+    peak_vel  = 0.0
+
+    for r in results:
+        if r.keypoints is not None and len(r.keypoints.data) > 0:
+            kps_draw = r.keypoints.data[0].cpu().numpy()
+
+            # Bounding box
+            if r.boxes is not None and len(r.boxes) > 0:
+                bbox_info = r.boxes.xyxy.cpu().numpy()[0]
+
+            # ── 4-state machine (Colab v3 logic) ──────────────
+            state, velocity, peak_vel = detector.process_frame(kps_draw, frame_num)
+
+            break   # only process first person
+
+    # ── Fall confirmation counter (Colab v3 style) ────────────
+    if state == "FALLEN" and not speech_pending:
+        risk_frames.append(frame_num)
+        if len(risk_frames) >= FALL_CONFIRM_FRAMES:
+            speech_pending = True
+            threading.Thread(
+               target=send_fall_alert,
+               args=("FALL_DETECTED", "Robot detected fall via pose + velocity"),
+               daemon=True
+            ).start()
+
+            # ── Trigger Bluetooth speaker interaction ──────────
+            fh_img, fw_img = frame.shape[:2]
+            outcome = handle_fall_response(detector, frame, fw_img, fh_img)
+
+            risk_frames    = []
+            speech_pending = False
+
+            if outcome == "RESUME":
+                print("\n▶️  Monitoring resumed with clean state.")
+            elif outcome == "ALERTED":
+                print("ℹ️  Alert sent — continuing monitoring.")
+
+    elif state == "SLEEPING":
+        risk_frames = []
+        if frame_num % 90 == 0:
+            print(f"😴 Frame {frame_num}: SLEEPING")
+
+    elif state == "UPRIGHT":
+        if risk_frames:
+            print(f"✅ Frame {frame_num}: UPRIGHT — risk cleared")
+        risk_frames = []
+
+    # ── Draw overlay ──────────────────────────────────────────
+    if kps_draw is not None:
+        frame = draw_overlay(frame, kps_draw, detector,
+                             frame_num, timestamp,
+                             velocity=velocity,
+                             peak_vel=peak_vel,
+                             bbox_info=bbox_info)
+    else:
+        cv2.putText(frame, "STATE: NO PERSON",
+                    (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+
+    cv2.imshow("Fall Detection System", frame)
+    frame_num += 1
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cv2.destroyAllWindows()
+picam2.stop()
